@@ -19,15 +19,15 @@
 import * as http from 'http';
 import * as net from 'net';
 import { inspect } from 'util';
-import WebSocket, { WebSocketServer } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import { randomUUID } from 'crypto';
 import jwt, { Algorithm } from 'jsonwebtoken';
-import { parse } from 'cookie';
-import Redis, { RedisOptions } from 'ioredis';
+import { parseCookie } from 'cookie';
+import { Redis, RedisOptions } from 'ioredis';
 import StatsD from 'hot-shots';
 
-import { createLogger } from './logger';
-import { buildConfig, RedisConfig } from './config';
+import { createLogger } from './logger.js';
+import { buildConfig, RedisConfig } from './config.js';
 import { checkServerIdentity, PeerCertificate } from 'tls';
 
 export type StreamResult = [
@@ -390,7 +390,7 @@ export const processStreamResults = async (
  * configured via 'jwtCookieName' in the config.
  */
 const readChannelId = (request: http.IncomingMessage): string => {
-  const cookies = parse(request.headers.cookie || '');
+  const cookies = parseCookie(request.headers.cookie || '');
   const token = cookies[opts.jwtCookieName];
 
   if (!token) throw new Error('JWT not present');
@@ -475,12 +475,18 @@ export const wsConnection = (ws: WebSocket, request: http.IncomingMessage) => {
   // init event handler for `pong` events (connection management)
   ws.on('pong', function pong(data: Buffer) {
     const socketId = data.toString();
-    const socketInstance = sockets[socketId];
-    if (!socketInstance) {
+    // `sockets` is a plain object, so an unsolicited pong carrying an
+    // inherited key ('__proto__', 'constructor', 'hasOwnProperty', ...) as
+    // its payload would otherwise resolve through the prototype chain
+    // instead of missing outright, letting a client write an enumerable
+    // `pongTs` onto Object.prototype (tripped over by the for...in loops in
+    // checkSockets/cleanChannel on every GC pass). Guarding with an
+    // own-property check rejects every such key in one place.
+    if (!Object.prototype.hasOwnProperty.call(sockets, socketId)) {
       logger.warn(`pong received for nonexistent socket ${socketId}`);
-    } else {
-      socketInstance.pongTs = Date.now();
+      return;
     }
+    sockets[socketId].pongTs = Date.now();
   });
 };
 

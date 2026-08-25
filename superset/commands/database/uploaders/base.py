@@ -33,6 +33,7 @@ from superset.commands.database.exceptions import (
     DatabaseUploadFileTooLarge,
     DatabaseUploadNotSupported,
     DatabaseUploadSaveMetadataFailed,
+    DatabaseUploadSoftDeletedDatasetExistsError,
 )
 from superset.connectors.sqla.models import SqlaTable
 from superset.daos.database import DatabaseDAO
@@ -167,8 +168,6 @@ class UploadCommand(BaseCommand):
             )
         )
 
-        self._reader.read(self._file, self._model, self._table_name, self._schema)
-
         sqla_table = (
             db.session.query(SqlaTable)
             .filter_by(
@@ -179,11 +178,46 @@ class UploadCommand(BaseCommand):
             .one_or_none()
         )
         if not sqla_table:
+            from superset.subjects.utils import get_user_subject
+
+            user = get_user()
+            editors = []
+            if user:
+                subj = get_user_subject(user.id)
+                if subj:
+                    editors.append(subj)
+
+            # The lookup above runs through the soft-delete visibility filter,
+            # so a soft-deleted dataset over this table is invisible here.
+            # Without this guard the upload would create an active twin of the
+            # hidden row — permanently blocking its restore — or die on the
+            # legacy unique constraint. Check BEFORE ``reader.read`` writes
+            # the file's contents into the analytics database: that write is
+            # outside this command's metadata transaction and would not roll
+            # back. With SOFT_DELETE off, leftover soft-deleted rows are
+            # visible to the lookup above, so this branch is never reached
+            # for them (degraded-mode semantics, consistent with the create
+            # paths).
+            # Deferred import: daos.dataset pulls in views.base, which
+            # circularly imports back into the commands package at app init
+            # (same constraint documented in daos/dataset.py re: PR #40573).
+            from superset.daos.dataset import (  # noqa: PLC0415
+                DatasetDAO,
+            )
+
+            if soft_twin := DatasetDAO.find_soft_deleted_logical_duplicate(
+                self._model, Table(self._table_name, self._schema)
+            ):
+                raise DatabaseUploadSoftDeletedDatasetExistsError(str(soft_twin.uuid))
+
+        self._reader.read(self._file, self._model, self._table_name, self._schema)
+
+        if not sqla_table:
             sqla_table = SqlaTable(
                 table_name=self._table_name,
                 database=self._model,
                 database_id=self._model_id,
-                owners=[get_user()],
+                editors=editors,
                 schema=self._schema,
             )
             db.session.add(sqla_table)
@@ -227,11 +261,33 @@ class UploadCommand(BaseCommand):
         if size is not None and size > max_file_size:
             raise DatabaseUploadFileTooLarge()
 
+    @staticmethod
+    def _resolve_default_schema(database: Database) -> Optional[str]:
+        """Resolve the database's default schema so uploaded datasets carry an
+        explicit schema instead of NULL, which would otherwise duplicate an
+        existing dataset over the same table (see #36305)."""
+        try:
+            return database.get_default_schema(database.get_default_catalog())
+        except Exception:  # pylint: disable=broad-except
+            # Resolution opens an inspector connection; a failure here must
+            # degrade to the no-schema behavior rather than fail the upload.
+            logger.warning(
+                "Unable to resolve default schema for upload; proceeding without one",
+                exc_info=True,
+            )
+            return None
+
     def validate(self) -> None:
         self._model = DatabaseDAO.find_by_id(self._model_id)
         if not self._model:
             raise DatabaseNotFoundError()
-        if not schema_allows_file_upload(self._model, self._schema):
+        engine_resolved = False
+        if not self._schema:
+            self._schema = self._resolve_default_schema(self._model)
+            engine_resolved = self._schema is not None
+        if not schema_allows_file_upload(
+            self._model, self._schema, engine_resolved=engine_resolved
+        ):
             raise DatabaseSchemaUploadNotAllowed()
         if not self._model.db_engine_spec.supports_file_upload:
             raise DatabaseUploadNotSupported()

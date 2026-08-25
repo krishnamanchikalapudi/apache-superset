@@ -20,7 +20,7 @@ import logging
 import re
 from datetime import datetime
 from re import Pattern
-from typing import Any, Optional, TYPE_CHECKING, TypedDict
+from typing import Any, Callable, Optional, TYPE_CHECKING, TypedDict
 from urllib import parse
 
 from apispec import APISpec
@@ -30,9 +30,10 @@ from cryptography.hazmat.primitives import serialization
 from flask import current_app as app
 from flask_babel import gettext as __
 from marshmallow import fields, Schema
-from sqlalchemy import types
+from sqlalchemy import text, types
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.engine.url import URL
+from sqlalchemy.sql.elements import ColumnElement
 
 from superset.constants import TimeGrain
 from superset.databases.utils import make_url_safe
@@ -87,6 +88,11 @@ class SnowflakeEngineSpec(PostgresBaseEngineSpec):
     force_column_alias_quotes = True
     max_column_name_length = 256
 
+    # `PostgresBaseEngineSpec._extended_aggregations` (MEDIAN/STDDEV_SAMP/VAR_SAMP)
+    # is verified against real Postgres behavior, not Snowflake's; disable it here
+    # until someone confirms the same expressions against a live Snowflake instance.
+    _extended_aggregations: dict[str, Callable[[ColumnElement], ColumnElement]] = {}
+
     # Snowflake doesn't support IS true/false syntax, use = true/false instead
     use_equality_for_boolean_filters = True
 
@@ -96,6 +102,7 @@ class SnowflakeEngineSpec(PostgresBaseEngineSpec):
 
     supports_dynamic_schema = True
     supports_catalog = supports_dynamic_catalog = supports_cross_catalog_queries = True
+    supports_grouping_sets = True
 
     metadata = {
         "description": "Snowflake is a cloud-native data warehouse.",
@@ -265,12 +272,13 @@ class SnowflakeEngineSpec(PostgresBaseEngineSpec):
 
         In Snowflake, a catalog is called a "database".
         """
-        return {
-            catalog
-            for (catalog,) in inspector.bind.execute(
-                "SELECT DATABASE_NAME from information_schema.databases"
-            )
-        }
+        with inspector.engine.connect() as conn:
+            return {
+                catalog
+                for (catalog,) in conn.execute(
+                    text("SELECT DATABASE_NAME from information_schema.databases")
+                )
+            }
 
     @classmethod
     def epoch_to_dttm(cls) -> str:
@@ -354,19 +362,21 @@ class SnowflakeEngineSpec(PostgresBaseEngineSpec):
             dict[str, Any]
         ] = None,
     ) -> str:
-        return str(
-            URL.create(
-                "snowflake",
-                username=parameters.get("username"),
-                password=parameters.get("password"),
-                host=parameters.get("account"),
-                database=parameters.get("database"),
-                query={
-                    "role": parameters.get("role"),
-                    "warehouse": parameters.get("warehouse"),
-                },
-            )
-        )
+        # SQLAlchemy 2.0 made URL.__str__() hide the password by default
+        # (it rendered in full under 1.4); render_as_string(hide_password=
+        # False) is required here since this URI is stored/used to actually
+        # connect, not just displayed.
+        return URL.create(
+            "snowflake",
+            username=parameters.get("username"),
+            password=parameters.get("password"),
+            host=parameters.get("account"),
+            database=parameters.get("database"),
+            query={
+                "role": parameters.get("role"),
+                "warehouse": parameters.get("warehouse"),
+            },
+        ).render_as_string(hide_password=False)
 
     @classmethod
     def get_parameters_from_uri(

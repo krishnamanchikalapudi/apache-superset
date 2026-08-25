@@ -42,7 +42,6 @@ from superset.mcp_service.chart.tool.get_chart_sql import (
     _resolve_metrics_and_groupby,
     get_chart_sql,
 )
-from superset.mcp_service.utils import sanitize_for_llm_context
 
 _get_chart_sql_mod = importlib.import_module(
     "superset.mcp_service.chart.tool.get_chart_sql"
@@ -108,17 +107,15 @@ class TestExtractSqlFromResult:
             datasource_name="my_table",
         )
         assert isinstance(output, ChartSql)
-        assert output.sql == sanitize_for_llm_context(
-            "SELECT * FROM my_table WHERE x > 1"
-        )
+        assert output.sql == ("SELECT * FROM my_table WHERE x > 1")
         assert output.language == "sql"
         assert output.chart_id == 10
-        assert output.chart_name == sanitize_for_llm_context("Sales Chart")
-        assert output.datasource_name == sanitize_for_llm_context("my_table")
+        assert output.chart_name == ("Sales Chart")
+        assert output.datasource_name == ("my_table")
         assert output.error is None
 
-    def test_successful_sql_extraction_sanitizes_datasource_name(self):
-        """Chart SQL wrapping treats datasource names as LLM-facing content."""
+    def test_successful_sql_extraction_preserves_datasource_name(self):
+        """Chart SQL preserves datasource names as domain values."""
         result = {
             "queries": [
                 {
@@ -137,10 +134,8 @@ class TestExtractSqlFromResult:
         )
 
         assert isinstance(output, ChartSql)
-        assert output.datasource_name == sanitize_for_llm_context("analytics.orders")
-        assert output.error == sanitize_for_llm_context(
-            "Query 1: Missing optional predicate"
-        )
+        assert output.datasource_name == ("analytics.orders")
+        assert output.error == ("Query 1: Missing optional predicate")
 
     def test_empty_queries_returns_error(self):
         """Test that empty query results return a ChartError."""
@@ -193,7 +188,7 @@ class TestExtractSqlFromResult:
             result, chart_id=7, chart_name="Partial", datasource_name="tbl"
         )
         assert isinstance(output, ChartSql)
-        assert output.sql == sanitize_for_llm_context("SELECT col1 FROM tbl")
+        assert output.sql == ("SELECT col1 FROM tbl")
         assert output.error is not None
 
     def test_null_chart_metadata(self):
@@ -1031,6 +1026,24 @@ class TestGetChartSqlTool:
             data = result.structured_content.get("result", result.structured_content)
             assert data["error_type"] == "NotFound"
             assert "999" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_guest_denied(self, mcp_server):
+        """An embedded guest is denied chart SQL (data-model metadata), even with
+        RBAC off — chart SQL exposes tables/columns/joins, like get_dataset_info."""
+        from fastmcp import Client
+
+        from superset.extensions import security_manager
+
+        with patch.object(security_manager, "is_guest_user", return_value=True):
+            async with Client(mcp_server) as client:
+                result = await client.call_tool(
+                    "get_chart_sql", {"request": {"identifier": 123}}
+                )
+
+            data = result.structured_content.get("result", result.structured_content)
+            assert data["error_type"] == "Forbidden"
+            assert "guest" in data["error"].lower()
 
     @patch.object(_get_chart_sql_mod, "_sql_from_form_data")
     @patch.object(_get_chart_sql_mod, "_sql_from_saved_query_context")
